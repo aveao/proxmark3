@@ -568,9 +568,13 @@ static int emrtd_read_file(uint8_t *dataout, int *dataoutlen, uint8_t *kenc, uin
     return true;
 }
 
-static bool emrtd_lds_get_data_by_tag(uint8_t *datain, int datainlen, uint8_t *dataout, int *dataoutlen, int tag1, int tag2, bool twobytetag) {
-    int offset = 1;
-    offset += emrtd_get_asn1_field_length(datain, datainlen, offset);
+static bool emrtd_lds_get_data_by_tag(uint8_t *datain, int *datainlen, uint8_t *dataout, int *dataoutlen, int tag1, int tag2, bool twobytetag, bool do_offset) {
+    int offset = 0;
+
+    // Add an offset only when reading through files
+    if (do_offset) {
+        offset += 1 + emrtd_get_asn1_field_length(datain, datainlen, 1);
+    }
 
     int e_idlen = 0;
     int e_datalen = 0;
@@ -741,7 +745,7 @@ static bool emrtd_dump_ef_dg5(uint8_t *file_contents, int file_length) {
     int datalen = 0;
 
     // If we can't find image in EF_DG5, return false.
-    if (emrtd_lds_get_data_by_tag(file_contents, file_length, data, &datalen, 0x5F, 0x40, true) == false) {
+    if (emrtd_lds_get_data_by_tag(file_contents, file_length, data, &datalen, 0x5F, 0x40, true, true) == false) {
         return false;
     }
 
@@ -1013,7 +1017,7 @@ int dumpHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_availab
     uint8_t filelist[50];
     int filelistlen = 0;
 
-    if (!emrtd_lds_get_data_by_tag(response, resplen, filelist, &filelistlen, 0x5c, 0x00, false)) {
+    if (!emrtd_lds_get_data_by_tag(response, resplen, filelist, &filelistlen, 0x5c, 0x00, false, true)) {
         PrintAndLogEx(ERR, "Failed to read file list from EF_COM.");
         DropField();
         return PM3_ESOFT;
@@ -1210,7 +1214,7 @@ static bool emrtd_print_ef_dg1_info(uint8_t *response, int resplen) {
     char mrz[90] = { 0x00 };
     int mrzlen = 0;
 
-    if (!emrtd_lds_get_data_by_tag(response, resplen, (uint8_t *) mrz, &mrzlen, 0x5f, 0x1f, true)) {
+    if (!emrtd_lds_get_data_by_tag(response, resplen, (uint8_t *) mrz, &mrzlen, 0x5f, 0x1f, true, true)) {
         PrintAndLogEx(ERR, "Failed to read MRZ from EF_DG1.");
         return false;
     }
@@ -1283,6 +1287,62 @@ static bool emrtd_print_ef_dg1_info(uint8_t *response, int resplen) {
     return true;
 }
 
+static bool emrtd_print_ef_dg2_info(uint8_t *response, int resplen) {
+    int bigtemplatelen, bitlen, bhtlen, e_datalen, e_fieldlen = 0;
+    // Biometric Information Group Template
+    uint8_t bigtemplate[EMRTD_MAX_FILE_SIZE] = { 0x00 };
+    // Biometric Information Template
+    uint8_t bit[EMRTD_MAX_FILE_SIZE] = { 0x00 };
+    // Biometric Header Template
+    uint8_t bht[30] = { 0x00 };
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, "-------------------- " _CYAN_("EF_DG2") " --------------------");
+
+    if (!emrtd_lds_get_data_by_tag(response, &resplen, bigtemplate, &bigtemplatelen, 0x7F, 0x61, true, true)) {
+        PrintAndLogEx(ERR, "Failed to read Biometric Information Group Template from EF_DG2.");
+        return false;
+    }
+
+    if (!emrtd_lds_get_data_by_tag(bigtemplate, &bigtemplatelen, bit, &bitlen, 0x7F, 0x60, true, false)) {
+        PrintAndLogEx(ERR, "Failed to read Biometric Information Template from EF_DG2.");
+        return false;
+    }
+
+    if (!emrtd_lds_get_data_by_tag(bit, &bitlen, bht, &bhtlen, 0xA1, 0x00, false, false)) {
+        PrintAndLogEx(ERR, "Failed to read Biometric Header Template from EF_DG2.");
+        return false;
+    }
+
+    int offset = 0;
+
+    // https://www.ibia.org/cbeff/iso
+    // https://en.wikipedia.org/wiki/CBEFF -> extremely detailed, somehow.
+
+    while (offset < bhtlen) {
+        // Get the length of the element
+        e_datalen = emrtd_get_asn1_data_length(bht + offset, bhtlen - offset, 1);
+
+        // Get the length of the element's length
+        e_fieldlen = emrtd_get_asn1_field_length(bht + offset, bhtlen - offset, 1);
+
+        switch (bht[offset]) {
+            case 0x80:
+                PrintAndLogEx(SUCCESS, "Image Header Version..: " _YELLOW_("%s"), sprint_hex_inrow(bht + offset + e_fieldlen + 1, e_datalen));
+                break;
+            case 0x80:
+                PrintAndLogEx(SUCCESS, "Image Header Version..: " _YELLOW_("%s"), sprint_hex_inrow(bht + offset + e_fieldlen + 1, e_datalen));
+                break;
+            default:
+                PrintAndLogEx(SUCCESS, "Unknown Field %02X......: %s", bht[offset], sprint_hex_inrow(bht + offset + e_fieldlen + 1, e_datalen));
+                break;
+        }
+        // + 1 for length of ID
+        offset += 1 + e_datalen + e_fieldlen;
+    }
+    return true;
+}
+
 static bool emrtd_print_ef_dg11_info(uint8_t *response, int resplen) {
     uint8_t taglist[100] = { 0x00 };
     int taglistlen = 0;
@@ -1292,13 +1352,13 @@ static bool emrtd_print_ef_dg11_info(uint8_t *response, int resplen) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "-------------------- " _CYAN_("EF_DG11") " -------------------");
 
-    if (!emrtd_lds_get_data_by_tag(response, resplen, taglist, &taglistlen, 0x5c, 0x00, false)) {
+    if (!emrtd_lds_get_data_by_tag(response, resplen, taglist, &taglistlen, 0x5c, 0x00, false, true)) {
         PrintAndLogEx(ERR, "Failed to read file list from EF_DG11.");
         return false;
     }
 
     for (int i = 0; i < taglistlen; i++) {
-        emrtd_lds_get_data_by_tag(response, resplen, tagdata, &tagdatalen, taglist[i], taglist[i + 1], taglist[i] == 0x5f);
+        emrtd_lds_get_data_by_tag(response, resplen, tagdata, &tagdatalen, taglist[i], taglist[i + 1], taglist[i] == 0x5f, true);
         // Special behavior for two char tags
         if (taglist[i] == 0x5f) {
             switch (taglist[i + 1]) {
@@ -1364,13 +1424,13 @@ static bool emrtd_print_ef_dg12_info(uint8_t *response, int resplen) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "-------------------- " _CYAN_("EF_DG12") " -------------------");
 
-    if (!emrtd_lds_get_data_by_tag(response, resplen, taglist, &taglistlen, 0x5c, 0x00, false)) {
+    if (!emrtd_lds_get_data_by_tag(response, resplen, taglist, &taglistlen, 0x5c, 0x00, false, true)) {
         PrintAndLogEx(ERR, "Failed to read file list from EF_DG12.");
         return false;
     }
 
     for (int i = 0; i < taglistlen; i++) {
-        emrtd_lds_get_data_by_tag(response, resplen, tagdata, &tagdatalen, taglist[i], taglist[i + 1], taglist[i] == 0x5f);
+        emrtd_lds_get_data_by_tag(response, resplen, tagdata, &tagdatalen, taglist[i], taglist[i + 1], taglist[i] == 0x5f, true);
         // Special behavior for two char tags
         if (taglist[i] == 0x5f) {
             // Several things here are longer than the rest but I can't think of a way to shorten them
@@ -1452,7 +1512,7 @@ int infoHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_availab
     uint8_t filelist[50];
     int filelistlen = 0;
 
-    if (!emrtd_lds_get_data_by_tag(response, resplen, filelist, &filelistlen, 0x5c, 0x00, false)) {
+    if (!emrtd_lds_get_data_by_tag(response, resplen, filelist, &filelistlen, 0x5c, 0x00, false, true)) {
         PrintAndLogEx(ERR, "Failed to read file list from EF_COM.");
         DropField();
         return PM3_ESOFT;
@@ -1469,6 +1529,8 @@ int infoHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_availab
 
         if (strcmp(file_name, "EF_DG1") == 0 && emrtd_select_and_read(response, &resplen, EMRTD_EF_DG1, ks_enc, ks_mac, ssc, BAC, use_14b)) {
             emrtd_print_ef_dg1_info(response, resplen);
+        } else if (strcmp(file_name, "EF_DG2") == 0 && emrtd_select_and_read(response, &resplen, EMRTD_EF_DG2, ks_enc, ks_mac, ssc, BAC, use_14b)) {
+            emrtd_print_ef_dg2_info(response, resplen);
         } else if (strcmp(file_name, "EF_DG11") == 0 && emrtd_select_and_read(response, &resplen, EMRTD_EF_DG11, ks_enc, ks_mac, ssc, BAC, use_14b)) {
             emrtd_print_ef_dg11_info(response, resplen);
         } else if (strcmp(file_name, "EF_DG12") == 0 && emrtd_select_and_read(response, &resplen, EMRTD_EF_DG12, ks_enc, ks_mac, ssc, BAC, use_14b)) {
